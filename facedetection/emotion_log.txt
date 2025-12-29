@@ -1,0 +1,6 @@
+2025-09-12 12:23:55 - Emotion: neutral, Score: 0.79
+2025-09-12 12:24:00 - Emotion: neutral, Score: 0.72
+2025-09-12 12:24:05 - Emotion: neutral, Score: 0.67
+2025-09-12 12:24:10 - No face detected
+2025-09-12 12:24:15 - Emotion: sad, Score: 0.56
+2025-09-12 12:24:20 - Emotion: happy, Score: 0.96
