@@ -1,6 +1,6 @@
 
 # # krtik's work
-
+# now no need
 # import cv2
 # import time
 # import numpy as np
@@ -95,7 +95,7 @@
 #    main() 
 
 
-
+# working code
 import cv2
 import time
 from collections import Counter
@@ -209,4 +209,5 @@ def index():
 
 if __name__ == "__main__":
     app.run(port=8000, debug=True)
+
 
