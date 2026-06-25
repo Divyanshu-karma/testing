@@ -1,0 +1,319 @@
+import json
+import sys
+import os
+import re
+from collections import Counter
+
+# Unified category mapping for internal comparison
+CATEGORY_MAP = {
+    "STATE_LAW": "STATE_MARKS",
+    "COMMON_LAW": "COMMON_LAW",
+    "WEB_COMMON_LAW": "WEB_COMMON_LAW",
+    "USPTO": "USPTO_MARKS",
+    "BUSINESS_NAME": "BUSINESS_NAME",
+    "DOMAIN_NAME": "WEB_DOMAIN",
+}
+
+def normalize_class_list(val):
+    """
+    Normalizes class list representations into a sorted tuple of integers.
+    Handles list of ints: [29, 30]
+    Handles string JSON array: '["001", "029"]'
+    """
+    if val is None:
+        return ()
+    
+    if isinstance(val, str):
+        try:
+            # Try parsing as JSON first
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                val = parsed
+            else:
+                # If not list, split by comma if applicable
+                val = [v.strip() for v in val.split(",") if v.strip()]
+        except json.JSONDecodeError:
+            # Fallback to simple split
+            val = [v.strip() for v in val.split(",") if v.strip()]
+            
+    if isinstance(val, list):
+        result = []
+        for item in val:
+            try:
+                # Remove leading zeros and convert to int
+                result.append(int(str(item).lstrip('0') or '0'))
+            except (ValueError, TypeError):
+                continue
+        return tuple(sorted(list(set(result))))
+        
+    return ()
+
+def perform_gate2_check_pattern1(data1, data2):
+    """
+    Deep field comparison for Pattern 1 (State Law).
+    Matches JSON 2 records to JSON 1 blocks by registration number.
+    Returns (passed_count, total_records, failures_list)
+    """
+    # 1. Filter JSON 1 for STATE_LAW blocks
+    json1_state_blocks = [block for block in data1 if block.get("source_type") == "STATE_LAW"]
+    
+    # Create lookup map for JSON 1 by normalized registration number
+    # Remove commas and non-digits for robust matching
+    def clean_reg_no(s):
+        return "".join(re.findall(r'\d+', str(s)))
+
+    json1_map = {}
+    for block in json1_state_blocks:
+        reg_no = clean_reg_no(block.get("registration_number", ""))
+        if reg_no:
+            json1_map[reg_no] = block
+
+    # 2. Iterate JSON 2 records
+    json2_records = data2.get("state_summary_data", [])
+    total = len(json2_records)
+    passed = 0
+    failures = []
+
+    for rec in json2_records:
+        reg_no_2 = clean_reg_no(rec.get("registration_no", ""))
+        us_id = rec.get("us_identifier", "Unknown")
+        
+        if reg_no_2 not in json1_map:
+            failures.append(f"{us_id}: No matching registration number '{reg_no_2}' found in JSON 1.")
+            continue
+            
+        block1 = json1_map[reg_no_2]
+        
+        # Field Comparison
+        # 1. Owner
+        owner1 = str(block1.get("owner", "")).strip()
+        owner2 = str(rec.get("owner_name", "")).strip()
+        
+        # 2. Goods/Services
+        gs1 = str(block1.get("goods_services", "")).strip()
+        gs2 = str(rec.get("goods_services_description", "")).strip()
+        
+        # 3. Class List (Normalized)
+        cl1 = normalize_class_list(block1.get("class_list"))
+        cl2 = normalize_class_list(rec.get("intl_class"))
+        
+        # 4. Trademark
+        tm1 = str(block1.get("trademark", "")).strip()
+        tm2 = str(rec.get("mark_text", "")).strip()
+        
+        match_errors = []
+        if owner1 != owner2: match_errors.append("Owner mismatch")
+        if gs1 != gs2: match_errors.append("Goods/Services mismatch")
+        if cl1 != cl2: match_errors.append(f"Class mismatch: {cl1} != {cl2}")
+        if tm1 != tm2: match_errors.append("Trademark mismatch")
+        
+        if not match_errors:
+            passed += 1
+        else:
+            failures.append(f"{us_id} (Reg {reg_no_2}): " + ", ".join(match_errors))
+
+    return passed, total, failures
+
+def detect_pattern(data2):
+    """
+    Detects if the second JSON file follows Pattern 1, Pattern 2, Pattern 3, or Pattern 4.
+    Returns 'pattern1', 'pattern2', 'pattern3', 'pattern4', or None.
+    """
+    if "Applicant_data" in data2 and "state_summary_data" in data2:
+        return "pattern1"
+    
+    if "table_data" in data2 and "business_records" in data2 and "records" in data2:
+        return "pattern4"
+    
+    return_type = data2.get("return_type")
+    records = data2.get("records")
+    
+    if return_type == "common law" and isinstance(records, list):
+        # Pattern 3 strict check
+        if data2.get("section") == "web_results" and "Webresult_corsearch_start" in data2:
+            return "pattern3"
+        # Pattern 2 strict check
+        if "Web_corsearch_start_page" in data2:
+            return "pattern2"
+        
+    return None
+
+def validate_json1_schema(data1):
+    """
+    Validates JSON 1: must be a list of objects, each containing 'source_type'.
+    """
+    if not isinstance(data1, list):
+        raise ValueError("JSON 1 must be a list of blocks.")
+    for i, block in enumerate(data1):
+        if not isinstance(block, dict):
+            raise ValueError(f"JSON 1 block at index {i} must be an object.")
+        if "source_type" not in block:
+            raise ValueError(f"JSON 1 block at index {i} is missing 'source_type'.")
+
+def validate_json2_schema(data2, pattern):
+    """
+    Validates JSON 2 structure based on the detected pattern.
+    """
+    if not isinstance(data2, dict):
+        raise ValueError("JSON 2 must be an object.")
+        
+    if pattern == "pattern1":
+        if not isinstance(data2.get("state_summary_data"), list):
+            raise ValueError("Pattern 1 JSON 2 missing 'state_summary_data' list.")
+    elif pattern in ["pattern2", "pattern3"]:
+        if not isinstance(data2.get("records"), list):
+            raise ValueError(f"Pattern {pattern[-1]} JSON 2 missing 'records' list.")
+    elif pattern == "pattern4":
+        if not isinstance(data2.get("business_records"), list):
+            raise ValueError("Pattern 4 JSON 2 missing 'business_records' list.")
+        if not isinstance(data2.get("records"), list):
+            raise ValueError("Pattern 4 JSON 2 missing 'records' list.")
+
+def get_normalized_counts_json1(data1):
+    """
+    Normalizes JSON 1 into category counts using CATEGORY_MAP.
+    """
+    counts = Counter()
+    for block in data1:
+        st = block.get("source_type")
+        if st in CATEGORY_MAP:
+            counts[CATEGORY_MAP[st]] += 1
+    return counts
+
+def get_normalized_counts_json2(data2, pattern):
+    """
+    Normalizes JSON 2 into category counts based on its pattern.
+    Also performs internal sequence/ID validation.
+    """
+    counts = Counter()
+    
+    if pattern == "pattern1":
+        records = data2.get("state_summary_data", [])
+        counts["STATE_MARKS"] = len(records)
+        if records:
+            last_id = records[-1].get("us_identifier", "")
+            match = re.search(r"US-(\d+)", last_id)
+            if match and int(match.group(1)) != counts["STATE_MARKS"]:
+                print(f"Warning: JSON 2 sequence mismatch. Count: {counts['STATE_MARKS']}, Last ID: {last_id}")
+
+    elif pattern == "pattern2":
+        records = data2.get("records", [])
+        counts["COMMON_LAW"] = len(records)
+        if records:
+            last_id = records[-1].get("Doc No.", "")
+            match = re.search(r"CML-(\d+)", last_id)
+            if match and int(match.group(1)) != counts["COMMON_LAW"]:
+                print(f"Warning: JSON 2 sequence mismatch. Count: {counts['COMMON_LAW']}, Last ID: {last_id}")
+
+    elif pattern == "pattern3":
+        records = data2.get("records", [])
+        counts["WEB_COMMON_LAW"] = len(records)
+        if records:
+            last_id = records[-1].get("web", "0")
+            try:
+                if int(last_id) != counts["WEB_COMMON_LAW"]:
+                    print(f"Warning: JSON 2 sequence mismatch. Count: {counts['WEB_COMMON_LAW']}, Last: {last_id}")
+            except (ValueError, TypeError): pass
+
+    elif pattern == "pattern4":
+        biz_records = data2.get("business_records", [])
+        dom_records = data2.get("records", [])
+        counts["BUSINESS_NAME"] = len(biz_records)
+        counts["WEB_DOMAIN"] = len(dom_records)
+        
+        if biz_records:
+            last_bsn = biz_records[-1].get("bsn", "0")
+            try:
+                if int(last_bsn) != counts["BUSINESS_NAME"]:
+                    print(f"Warning: JSON 2 bsn mismatch. Count: {counts['BUSINESS_NAME']}, Last: {last_bsn}")
+            except (ValueError, TypeError): pass
+            
+        if dom_records:
+            last_dnn = dom_records[-1].get("dnn", "0")
+            try:
+                if int(last_dnn) != counts["WEB_DOMAIN"]:
+                    print(f"Warning: JSON 2 dnn mismatch. Count: {counts['WEB_DOMAIN']}, Last: {last_dnn}")
+            except (ValueError, TypeError): pass
+
+    return counts
+
+def compare_categories(counts1, counts2, pattern):
+    """
+    Determines which categories are relevant for the given pattern and compares them.
+    Returns (match_status, failure_reason)
+    """
+    relevant_categories = {
+        "pattern1": ["STATE_MARKS"],
+        "pattern2": ["COMMON_LAW"],
+        "pattern3": ["WEB_COMMON_LAW"],
+        "pattern4": ["BUSINESS_NAME", "WEB_DOMAIN"]
+    }.get(pattern, [])
+
+    failures = []
+    for cat in relevant_categories:
+        c1, c2 = counts1[cat], counts2[cat]
+        print(f"{cat:15}: JSON 1 = {c1:3}, JSON 2 = {c2:3}")
+        if c1 != c2:
+            failures.append(f"JSON 1 count = {c1}, JSON 2 count = {c2}")
+            
+    if not failures:
+        return True, ""
+    else:
+        return False, "; ".join(failures)
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python comparition_v1.py <path_to_json1> <path_to_json2>")
+        sys.exit(1)
+
+    path1, path2 = sys.argv[1], sys.argv[2]
+    try:
+        with open(path1, "r", encoding="utf-8") as f: data1 = json.load(f)
+        with open(path2, "r", encoding="utf-8") as f: data2 = json.load(f)
+    except Exception as e:
+        print(f"Error reading JSON files: {e}"); sys.exit(1)
+
+    pattern = detect_pattern(data2)
+    if not pattern:
+        print("No recognized pattern detected in the second JSON file."); sys.exit(1)
+
+    try:
+        validate_json1_schema(data1)
+        validate_json2_schema(data2, pattern)
+    except ValueError as e:
+        print(f"Schema Validation Error: {e}"); sys.exit(1)
+
+    print(f"Detected Pattern: {pattern}")
+    
+    counts1 = get_normalized_counts_json1(data1)
+    counts2 = get_normalized_counts_json2(data2, pattern)
+    
+    match_ok, reason = compare_categories(counts1, counts2, pattern)
+    if match_ok:
+        print("Gate 1 Passes: Counting variables match.")
+        
+        # GATE 2 IMPLEMENTATION
+        if pattern == "pattern1":
+            print("\nStarting Gate 2 Verification (Deep Field Comparison)...")
+            passed, total, failures = perform_gate2_check_pattern1(data1, data2)
+            print(f"Gate 2 Result: {passed}/{total} records passed.")
+            if failures:
+                print("Gate 2 Failures/Mismatches:")
+                for fail in failures:
+                    print(f"  - {fail}")
+            
+            if passed == total:
+                print("Gate 2 Passes: All fields match.")
+                sys.exit(0)
+            else:
+                print("Gate 2 Fails: Field mismatches detected.")
+                sys.exit(1)
+        else:
+            # Pattern 2, 3, 4 Gate 2 not yet implemented as per request
+            sys.exit(0)
+    else:
+        print(f"gate-1 is failed. Reason: {reason}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
