@@ -1,5 +1,6 @@
 import json
 import sys
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -59,6 +60,12 @@ def normalize_owner(name):
         return ""
     # Convert to uppercase
     name = str(name).upper()
+    
+    # Requirement 3: Normalize acronym punctuation (U.S. -> US)
+    # Match patterns like U.S. or A.B.C. and remove the dots
+    # We look for single letters followed by a dot, repeated.
+    name = re.sub(r'\b([A-Z])\.(?=[A-Z]\.|\b)', r'\1', name)
+
     # Remove apostrophes to match (e.g., "Zatarain's" -> "ZATARAINS")
     name = name.replace("'", "")
     # Remove other common punctuation and replace with space
@@ -73,11 +80,39 @@ def normalize_owner(name):
 
 def normalize_goods_services(text):
     """
-    Normalizes goods and services text: uppercase, strip, collapse spaces.
+    Normalizes goods and services text: uppercase, strip, collapse spaces,
+    and collapses repeated consecutive phrases.
     """
     if not text:
         return ""
-    return re.sub(r'\s+', ' ', str(text).upper()).strip()
+    
+    # Basic normalization
+    text = re.sub(r'\s+', ' ', str(text).upper()).strip()
+    
+    # Requirement 1: Collapse repeated consecutive phrases
+    # Example: "ABC ABC" -> "ABC"
+    # We use a regex that matches a phrase followed by itself one or more times.
+    # To keep it safe and avoid accidental over-matching, we look for space-separated identical blocks.
+    # This is a bit tricky with regex for long phrases. A better way is a loop or specific split.
+    
+    words = text.split()
+    if not words:
+        return ""
+        
+    def collapse_repeats(word_list):
+        n = len(word_list)
+        # Try finding repeated sequences of length 1 to n/2
+        for length in range(1, n // 2 + 1):
+            for i in range(n - 2 * length + 1):
+                phrase1 = word_list[i : i + length]
+                phrase2 = word_list[i + length : i + 2 * length]
+                if phrase1 == phrase2:
+                    # Found a repeat. Collapse it and recurse.
+                    return collapse_repeats(word_list[: i + length] + word_list[i + 2 * length :])
+        return word_list
+
+    collapsed_words = collapse_repeats(words)
+    return " ".join(collapsed_words)
 
 def normalize_mark_text(text):
     """
@@ -232,7 +267,7 @@ def _find_best_candidate(rec2: NormalizedRecord, candidates: List[NormalizedReco
 
 def _get_field_match_info(raw1: str, norm1: str, raw2: str, norm2: str, field_name: str) -> Dict[str, Any]:
     """
-    Analyzes matching depth: EXACT, NORMALIZED, or FAIL.
+    Analyzes matching depth: EXACT, NORMALIZED, PASS_SUBSTRING, PASS_SEMANTIC_NEAR or FAIL.
     """
     s1 = str(raw1 or "").strip()
     s2 = str(raw2 or "").strip()
@@ -247,6 +282,35 @@ def _get_field_match_info(raw1: str, norm1: str, raw2: str, norm2: str, field_na
             "error": None,
             "info": f"{field_name}: [NORMALIZED MATCH] J1:'{s1}' | J2:'{s2}' (Norm: '{n1}')"
         }
+    
+    # Requirement 2: PASS_SUBSTRING
+    if n1 and n2:
+        if n1 in n2 or n2 in n1:
+            return {
+                "status": "PASS_SUBSTRING",
+                "error": None,
+                "info": f"{field_name}: [SUBSTRING MATCH] J1:'{s1}' | J2:'{s2}'"
+            }
+
+    # Requirement 2: PASS_SEMANTIC_NEAR (Conservative matching for common semantic expansions)
+    # Wording like "mix" vs "mix for food preparation"
+    if field_name == "Goods" and n1 and n2:
+        # Check if the core meaning is preserved (very conservative)
+        # Using a simple check: if 70% of words in the shorter string are in the longer string
+        words1 = set(n1.split())
+        words2 = set(n2.split())
+        if words1 and words2:
+            intersection = words1.intersection(words2)
+            smaller_set = words1 if len(words1) < len(words2) else words2
+            if len(intersection) / len(smaller_set) >= 0.75:
+                # Also ensure the first word matches (common anchor)
+                if n1.split()[0] == n2.split()[0]:
+                    return {
+                        "status": "PASS_SEMANTIC_NEAR",
+                        "error": None,
+                        "info": f"{field_name}: [SEMANTIC NEAR] J1:'{s1}' | J2:'{s2}'"
+                    }
+
     return {
         "status": "FAIL",
         "error": f"{field_name}: [J1: '{s1}'] != [J2: '{s2}']",
@@ -352,6 +416,7 @@ def compare_web_common_law(json1_records: List[NormalizedRecord],
     """
     Comparator for WEB_COMMON_LAW.
     Tiered search: TM+Owner -> TM -> Owner.
+    Requirement 4 & 5: Improved owner and goods logic.
     """
     json1_tm_owner_map = {}
     json1_tm_map = {}
@@ -373,6 +438,9 @@ def compare_web_common_law(json1_records: List[NormalizedRecord],
     passed = 0
     failures = []
     report_lines = ["CATEGORY: WEB_COMMON_LAW GATE 2 REPORT", "="*40]
+
+    # Requirement 4: Unreliable owner list
+    UNRELIABLE_OWNERS = {"SHOP", "BAY", "PINTEREST", "POSTMATES", "MARKETPLACE", "SELLER", "HANDLE", "UNKNOWN"}
 
     for rec2 in json2_records:
         rec_id = rec2.record_id
@@ -398,13 +466,23 @@ def compare_web_common_law(json1_records: List[NormalizedRecord],
         if rec1:
             match_errors = []
             field_results = []
+            warning_only = False
             
-            # Use original Pattern 3 semantics: only compare goods if JSON 2 has them
-            if rec2.goods_raw:
+            # Requirement 5: Missing Goods Handling
+            if not rec2.goods_raw and rec1.goods_raw:
+                field_results.append({"status": "SKIPPED_MISSING_JSON2", "error": None, "info": "Goods: [SKIPPED] Missing in JSON 2"})
+            elif rec2.goods_raw:
                 f_goods = _get_field_match_info(rec1.goods_raw, rec1.goods_norm, rec2.goods_raw, rec2.goods_norm, "Goods")
                 field_results.append(f_goods)
             
+            # Requirement 4: Owner Unreliable Check
             f_owner = _get_field_match_info(rec1.owner_raw, rec1.owner_norm, rec2.owner_raw, rec2.owner_norm, "Owner")
+            if f_owner["status"] == "FAIL":
+                # Check if JSON 2 owner is in unreliable list or is very short/generic
+                if rec2.owner_norm in UNRELIABLE_OWNERS or not rec2.owner_norm or len(rec2.owner_norm) < 3:
+                    f_owner["status"] = "OWNER_WARNING"
+                    f_owner["info"] = f"Owner: [WARNING] Unreliable source '{rec2.owner_raw}'"
+                
             field_results.append(f_owner)
             
             f_tm = _get_field_match_info(rec1.trademark_raw, rec1.trademark_norm, rec2.trademark_raw, rec2.trademark_norm, "Trademark")
@@ -419,13 +497,18 @@ def compare_web_common_law(json1_records: List[NormalizedRecord],
                 
             if not match_errors:
                 passed += 1
-                is_normalized = any(fr["status"] == "NORMALIZED" for fr in field_results)
-                status = "PASS_NORMALIZED" if is_normalized else "PASS_EXACT"
-                report_lines.append(f"{status}: {rec_id} (Mark: {rec2.trademark_raw})")
-                if is_normalized:
-                    for fr in field_results:
-                        if fr["status"] == "NORMALIZED":
-                            report_lines.append(f"  - {fr['info']}")
+                # Determine top status
+                status_priority = ["PASS_EXACT", "PASS_NORMALIZED", "PASS_SUBSTRING", "PASS_SEMANTIC_NEAR", "SKIPPED_MISSING_JSON2", "OWNER_WARNING"]
+                current_top = "PASS_EXACT"
+                for fr in field_results:
+                    if fr["status"] in status_priority:
+                        if status_priority.index(fr["status"]) > status_priority.index(current_top):
+                            current_top = fr["status"]
+                
+                report_lines.append(f"{current_top}: {rec_id} (Mark: {rec2.trademark_raw})")
+                for fr in field_results:
+                    if fr.get("info"):
+                        report_lines.append(f"  - {fr['info']}")
             else:
                 failures.append(f"{rec_id}: " + " | ".join(match_errors))
                 report_lines.append(f"FAIL/PARTIAL: {rec_id}")
@@ -1088,77 +1171,149 @@ def run_gate2(json1_by_cat: Dict[str, List[NormalizedRecord]],
         
     return results
 
+def process_single_json2(json2_path: str, json1_by_cat: Dict[str, List[NormalizedRecord]]) -> Tuple[str, List[str], bool]:
+    """
+    Processes a single JSON2 file against pre-loaded JSON1 data.
+    Returns (filename, report_lines, is_pass).
+    """
+    fname = os.path.basename(json2_path)
+    print(f"\n{'='*60}")
+    print(f"PROCESSING: {fname}")
+    print(f"{'='*60}")
+    
+    try:
+        with open(json2_path, "r", encoding="utf-8") as f:
+            data2 = json.load(f)
+        
+        json2_records = extract_json2_records(data2)
+        if not json2_records:
+            msg = f"ERROR: No valid records found in {fname}"
+            print(msg)
+            return fname, [msg], False
+            
+        json2_by_cat = group_records_by_category(json2_records)
+        
+        # Gate 1
+        match_ok, g1_reason = compare_category_counts(json1_by_cat, json2_by_cat)
+        g1_status = "PASS" if match_ok else "FAIL"
+        
+        report_lines = [
+            f"========================================",
+            f"FILE: {fname}",
+            f"========================================",
+            f"Gate-1 Status: {g1_status}",
+        ]
+        if not match_ok:
+            report_lines.append(f"Gate-1 Failure Reason: {g1_reason}")
+            print(f"Gate-1 FAILED: {g1_reason}")
+            # Even if Gate 1 fails, we return False but keep the report
+            return fname, report_lines, False
+            
+        print("Gate-1 PASSED.")
+        
+        # Gate 2
+        print("Starting Gate-2 Deep Field Comparison...")
+        results = run_gate2(json1_by_cat, json2_by_cat)
+        
+        is_g2_pass = True
+        g2_report_parts = []
+        for res in results:
+            # Console output
+            print(f"\n  Category: {res.category}")
+            if res.category == "WEB_DOMAIN" and res.total_extracted > 0:
+                print(f"    Total extracted: {res.total_extracted} | Skipped: {res.skipped} | Effective: {res.total}")
+                print(f"    Passed: {res.passed} | Failed: {len(res.failures)}")
+            else:
+                print(f"    Result: {res.passed}/{res.total} records passed.")
+            
+            if res.failures:
+                print(f"    Failures/Mismatches:")
+                for fail in res.failures:
+                    print(f"      - {fail}")
+            
+            if res.passed != res.total:
+                is_g2_pass = False
+            
+            # Report assembly
+            g2_report_parts.extend(res.report_lines)
+            g2_report_parts.append("")
+            
+        g2_status = "PASS" if is_g2_pass else "FAIL"
+        report_lines.append(f"Gate-2 Status: {g2_status}")
+        report_lines.append("-" * 40)
+        report_lines.extend(g2_report_parts)
+        
+        return fname, report_lines, is_g2_pass
+        
+    except Exception as e:
+        err_msg = f"CRITICAL ERROR processing {fname}: {e}"
+        print(err_msg)
+        return fname, [f"FILE: {fname}", err_msg], False
+
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python comparition_v1.py <path_to_json1> <path_to_json2>")
+        print("Usage: python comparition_v1.py <path_to_json1> <path_to_json2_file1> [path_to_json2_file2] ...")
         sys.exit(1)
 
-    path1, path2 = sys.argv[1], sys.argv[2]
-    try:
-        with open(path1, "r", encoding="utf-8") as f: data1 = json.load(f)
-        with open(path2, "r", encoding="utf-8") as f: data2 = json.load(f)
-    except Exception as e:
-        print(f"Error reading JSON files: {e}"); sys.exit(1)
+    path1 = sys.argv[1]
+    json2_paths = sys.argv[2:]
 
-    # 1. Extraction and Grouping
+    try:
+        with open(path1, "r", encoding="utf-8") as f: 
+            data1 = json.load(f)
+    except Exception as e:
+        print(f"Error reading JSON1 file: {e}")
+        sys.exit(1)
+
+    # 1. Extraction and Grouping for JSON1 (Constant)
     try:
         json1_records = extract_json1_records(data1)
-        json2_records = extract_json2_records(data2)
-        
-        if not json2_records:
-            print("No valid category records found in the second JSON file."); sys.exit(1)
-            
         json1_by_cat = group_records_by_category(json1_records)
-        json2_by_cat = group_records_by_category(json2_records)
     except Exception as e:
-        print(f"Extraction Error: {e}"); sys.exit(1)
-
-    # 2. Gate 1: Category Count Verification
-    match_ok, reason = compare_category_counts(json1_by_cat, json2_by_cat)
-    if not match_ok:
-        print(f"gate-1 is failed. Reason: {reason}")
+        print(f"JSON1 Extraction Error: {e}")
         sys.exit(1)
-    
-    print("Gate 1 Passes: Category counts match.")
 
-    # 3. Gate 2: Deep Field Comparison
-    print("\nStarting Gate 2 Verification (Category-Based Comparison)...")
-    results = run_gate2(json1_by_cat, json2_by_cat)
+    all_file_reports = []
+    final_summary_stats = []
+
+    # 2. Process each JSON2 file
+    for p2 in json2_paths:
+        fname, report_lines, is_pass = process_single_json2(p2, json1_by_cat)
+        all_file_reports.extend(report_lines)
+        all_file_reports.append("\n" + "="*60 + "\n") # Big separator between files
+        
+        status_str = "PASS" if is_pass else "FAIL"
+        final_summary_stats.append((fname, status_str))
+
+    # 3. Generate Final Summary
+    summary_block = [
+        "==============================",
+        "FINAL SUMMARY",
+        "=============================="
+    ]
+    all_passed = True
+    for fname, status in final_summary_stats:
+        summary_block.append(f"{fname:30} : {status}")
+        if status == "FAIL":
+            all_passed = False
     
-    total_passed = True
+    # 4. Write Unified Report
     combined_report = ["GATE 2 UNIFIED COMPARISON REPORT", "="*40, ""]
-    
-    for res in results:
-        print(f"\nCategory: {res.category}")
-        if res.category == "WEB_DOMAIN" and res.total_extracted > 0:
-            print(f"  Total extracted records : {res.total_extracted}")
-            print(f"  Skipped (rule_filter)   : {res.skipped}")
-            print(f"  Effective compared      : {res.total}")
-            print(f"  Passed                  : {res.passed}")
-            print(f"  Failed                  : {len(res.failures)}")
-        else:
-            print(f"  Result: {res.passed}/{res.total} records passed.")
-        combined_report.extend(res.report_lines)
-        combined_report.append("") # Spacer
-        
-        if res.failures:
-            print(f"  Failures/Mismatches:")
-            for fail in res.failures:
-                print(f"    - {fail}")
-        
-        if res.passed != res.total:
-            total_passed = False
+    combined_report.extend(all_file_reports)
+    combined_report.extend(summary_block)
 
-    # Write unified report
     with open("comparison_report.txt", "w", encoding="utf-8") as rf:
         rf.write("\n".join(combined_report))
-    print(f"\nUnified Gate 2 report written to comparison_report.txt")
+    
+    print(f"\nUnified comparison report written to comparison_report.txt")
+    
+    print("\n" + "\n".join(summary_block))
 
-    if total_passed:
-        print("\nGate 2 Passes: All categories match.")
+    if all_passed:
+        print("\nOVERALL STATUS: PASS")
         sys.exit(0)
     else:
-        print("\nGate 2 Fails: Field mismatches detected in one or more categories.")
+        print("\nOVERALL STATUS: FAIL (One or more patterns failed)")
         sys.exit(1)
 
 if __name__ == "__main__":
